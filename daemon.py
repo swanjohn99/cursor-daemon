@@ -137,7 +137,7 @@ def _move_project(bs, name):
 
 # Operations
 def _projects_list():
-    projs = sorted([d.name for d in WORK_DIR.iterdir() if d.is_dir() and not d.name.startswith(".")])
+    projs = sorted([d.name for d in WORK_DIR.iterdir() if d.is_dir() and not d.name.startswith(".") and d.name != "cursor-daemon"])
     if not projs:
         return "No projects found."
     lines = ["Select a project:", ""]
@@ -148,7 +148,7 @@ def _projects_list():
     return "\n".join(lines)
 
 def _select(bs, num):
-    projs = sorted([d.name for d in WORK_DIR.iterdir() if d.is_dir() and not d.name.startswith(".")])
+    projs = sorted([d.name for d in WORK_DIR.iterdir() if d.is_dir() and not d.name.startswith(".") and d.name != "cursor-daemon"])
     if num < 1 or num > len(projs):
         return "Invalid. Pick 1-%d." % len(projs)
     return _move_project(bs, projs[num - 1])
@@ -245,6 +245,7 @@ def _cursor(bs, text):
 
 def dispatch(s, bs, text):
     lower = text.lower().strip()
+    lower = lower.rstrip(",.?!:;")  # strip trailing punctuation
 # voice commands
     if lower == "voice on":
         bs["voice_enabled"] = True
