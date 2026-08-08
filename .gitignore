@@ -1,4 +1,1 @@
-state.json
-*.ogg
-__pycache__/
-*.pyc
+state.json\n*.bak\n*.ogg\n__pycache__/\n*.pyc
