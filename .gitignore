@@ -1,0 +1,4 @@
+state.json
+*.ogg
+__pycache__/
+*.pyc

@@ -1,0 +1,595 @@
+#!/usr/bin/env python3
+"""
+Cursor Daemon v2 — Named operations, web-mapped commands, zero-token relay.
+"""
+import asyncio, json, os, subprocess, signal, html, shlex
+from pathlib import Path
+from datetime import datetime, timezone
+
+# ─── Config ─────────────────────────────────────────────────────────
+PORT = 9000
+HOST = "0.0.0.0"
+STATE_FILE = Path("/home/ubuntu/.cursor-daemon/state.json")
+WORK_DIR = Path("/home/ubuntu/work")
+CLI = Path("/home/ubuntu/.local/bin/agent")
+
+# ─── Default command mappings ──────────────────────────────────────
+DEFAULT_MAPPINGS = {}
+for i in range(1, 14):
+    DEFAULT_MAPPINGS[str(i)] = f"select_project_{i}"
+    DEFAULT_MAPPINGS[f"switch to {i}"] = f"select_project_{i}"
+    DEFAULT_MAPPINGS[f"go to {i}"] = f"select_project_{i}"
+    DEFAULT_MAPPINGS[f"select {i}"] = f"select_project_{i}"
+    DEFAULT_MAPPINGS[f"project {i}"] = f"select_project_{i}"
+
+DEFAULT_MAPPINGS.update({
+    "projects": "display_projects", "back": "display_projects",
+    "go back": "display_projects", "menu": "display_projects",
+    "show projects": "display_projects", "list projects": "display_projects",
+    "status": "display_status", "show status": "display_status",
+    "current project": "display_status", "what project": "display_status",
+    "help": "display_help", "show help": "display_help",
+    "lock": "display_lock", "show lock": "display_lock",
+    "force": "force_lock", "force lock": "force_lock",
+    "plan on": "mode_plan_on", "plan off": "mode_plan_off",
+    "turn on plan": "mode_plan_on", "turn off plan": "mode_plan_off",
+    "enable plan": "mode_plan_on", "disable plan": "mode_plan_off",
+    "mode agent": "mode_agent", "mode plan": "mode_plan",
+    "mode ask": "mode_ask", "mode shell": "mode_shell",
+    "agent mode": "mode_agent", "plan mode": "mode_plan",
+    "ask mode": "mode_ask", "shell mode": "mode_shell",
+})
+
+# ─── State ──────────────────────────────────────────────────────────
+def load_state():
+    if STATE_FILE.exists():
+        with open(STATE_FILE) as f:
+            s = json.load(f)
+    else:
+        s = {}
+    s.setdefault("bots", {})
+    s.setdefault("logs", [])
+    # Initialize mappings if missing
+    for bot_token in s["bots"]:
+        s["bots"][bot_token].setdefault("mappings", dict(DEFAULT_MAPPINGS))
+    return s
+
+def save_state(state):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2, default=str)
+
+def log(state, msg, level="info"):
+    entry = {"time": datetime.now(timezone.utc).isoformat(), "msg": msg, "level": level}
+    state.setdefault("logs", []).append(entry)
+    if len(state["logs"]) > 200:
+        state["logs"] = state["logs"][-200:]
+    print(f"[{entry['time']}] [{level}] {msg}")
+
+# ─── Per-bot state (stored per-bot in state.json) ──────────────────
+def bot_state(state, token):
+    bot = state["bots"].setdefault(token, {})
+    bot.setdefault("project", "")
+    bot.setdefault("current_mode", "agent")
+    bot.setdefault("current_model", "")
+    bot.setdefault("last_command", "")
+    bot.setdefault("mappings", dict(DEFAULT_MAPPINGS))
+    return bot
+
+# ─── Named operations ───────────────────────────────────────────────
+def op_display_projects(bs):
+    projects = sorted([d.name for d in WORK_DIR.iterdir() if d.is_dir() and not d.name.startswith(".")])
+    if not projects:
+        return "No projects found."
+    lines = ["Select a project:", ""]
+    for i, p in enumerate(projects, 1):
+        lines.append(f"{i}. {p}")
+    lines.append("")
+    lines.append(f"Reply with a number (1-{len(projects)}) to select.")
+    return "\n".join(lines)
+
+def op_select_project(bs, num):
+    projects = sorted([d.name for d in WORK_DIR.iterdir() if d.is_dir() and not d.name.startswith(".")])
+    if num < 1 or num > len(projects):
+        return f"Invalid. Pick 1-{len(projects)}."
+    name = projects[num - 1]
+    proj_dir = WORK_DIR / name
+    # Lock
+    lock_dir = proj_dir / ".agent-lock"
+    bot_name = bs.get("name", "daemon")
+    if lock_dir.exists():
+        owner_file = lock_dir / "owner"
+        if owner_file.exists():
+            owner = owner_file.read_text().strip().split("=", 1)[-1]
+            if owner != bot_name:
+                return f"LOCKED by {owner}. Use 'force' to override."
+    # Acquire lock
+    lock_dir.mkdir(exist_ok=True)
+    (lock_dir / "owner").write_text(f"agent_id={bot_name}\nlocked_at={datetime.now(timezone.utc).isoformat()}")
+    bs["project"] = name
+    return f"Now in: {name}\n\nAll messages go to Cursor Agent. Type 'projects' to switch."
+
+def op_mode(bs, mode):
+    bs["current_mode"] = mode
+    return f"Mode: {mode}"
+
+def op_display_status(bs):
+    proj = bs.get("project", "none")
+    mode = bs.get("current_mode", "agent")
+    model = bs.get("current_model", "(default)")
+    return f"Project: {proj}\nPath: {WORK_DIR / proj if proj != 'none' else '—'}\nModel: {model}\nMode: {mode}"
+
+def op_display_help(bs):
+    return """AVAILABLE COMMANDS:
+
+PROJECTS:
+  N (1-13)              — select project N
+  projects / back       — show project list
+
+MODE:
+  mode agent / plan / ask / shell — switch mode
+  plan on / turn on plan          — plan mode
+  plan off / turn off plan        — back to agent
+
+SETTINGS:
+  model <name>          — set Cursor model
+  status                — current state
+
+LOCKS:
+  lock                  — show lock status
+  force                 — override stale lock
+
+  help                  — show this message"""
+
+def op_display_lock(bs):
+    proj = bs.get("project", "")
+    if not proj:
+        return "No project selected."
+    lock_dir = WORK_DIR / proj / ".agent-lock"
+    owner_file = lock_dir / "owner"
+    if owner_file.exists():
+        owner = owner_file.read_text().strip().split("=", 1)[-1]
+        return f"Locked by: {owner}"
+    return "Not locked."
+
+def op_force_lock(bs):
+    proj = bs.get("project", "")
+    if not proj:
+        return "No project selected."
+    lock_dir = WORK_DIR / proj / ".agent-lock"
+    import shutil
+    if lock_dir.exists():
+        shutil.rmtree(lock_dir)
+    lock_dir.mkdir()
+    bot_name = bs.get("name", "daemon")
+    (lock_dir / "owner").write_text(f"agent_id={bot_name}\nlocked_at={datetime.now(timezone.utc).isoformat()}")
+    return "Lock acquired (forced)."
+
+def op_cursor_prompt(bs, text):
+    proj = bs.get("project", "")
+    if not proj:
+        return "No project selected. Pick a number first."
+    proj_dir = WORK_DIR / proj
+    if not proj_dir.is_dir():
+        return f"Project directory not found: {proj_dir}"
+    
+    mode = bs.get("current_mode", "agent")
+    model = bs.get("current_model", "")
+    
+    # Build agent command
+    cmd = [str(CLI), "-p"]
+    if mode == "plan":
+        cmd.append("--plan")
+    elif mode == "ask":
+        cmd.extend(["--mode", "ask"])
+    elif mode == "shell":
+        # Shell mode — execute directly
+        try:
+            result = subprocess.run(
+                ["bash", "-c", text],
+                capture_output=True, text=True, timeout=30,
+                cwd=str(proj_dir), env={**os.environ, "HOME": "/home/ubuntu"}
+            )
+            return result.stdout.strip() or result.stderr.strip() or "(empty)"
+        except subprocess.TimeoutExpired:
+            return "Command timed out (30s)."
+    
+    if model:
+        cmd.extend(["--model", model])
+    cmd.append(text)
+    
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120,
+            cwd=str(proj_dir), env={**os.environ, "HOME": "/home/ubuntu"}
+        )
+        output = result.stdout.strip() or result.stderr.strip()
+        return output or "(empty response from Cursor Agent)"
+    except subprocess.TimeoutExpired:
+        return "Cursor Agent timed out (120s)."
+    except Exception as e:
+        return f"Error: {e}"
+
+# ─── Command dispatch ───────────────────────────────────────────────
+def dispatch(bs, text):
+    """Look up text in bot's mappings, execute the named operation."""
+    mappings = bs.get("mappings", DEFAULT_MAPPINGS)
+    lower = text.lower().strip()
+    
+    # Exact lookup
+    op = mappings.get(lower)
+    if not op:
+        # Try case-insensitive
+        for k, v in mappings.items():
+            if k.lower() == lower:
+                op = v
+                break
+    
+    if not op:
+        return None  # Unknown
+    
+    # Model command: "model grok-4.5-high"
+    if lower.startswith("model "):
+        model_name = text.split(" ", 1)[1].strip() if " " in text else ""
+        if model_name:
+            bs["current_model"] = model_name
+            return f"Model: {model_name}"
+        return "Usage: model <name>"
+    
+    # Dispatch
+    if op == "display_projects":
+        return op_display_projects(bs)
+    elif op.startswith("select_project_"):
+        num = int(op.split("_")[-1])
+        return op_select_project(bs, num)
+    elif op == "mode_agent":
+        return op_mode(bs, "agent")
+    elif op == "mode_plan":
+        return op_mode(bs, "plan")
+    elif op == "mode_ask":
+        return op_mode(bs, "ask")
+    elif op == "mode_shell":
+        return op_mode(bs, "shell")
+    elif op == "mode_plan_on":
+        return op_mode(bs, "plan")
+    elif op == "mode_plan_off":
+        return op_mode(bs, "agent")
+    elif op == "display_status":
+        return op_display_status(bs)
+    elif op == "display_help":
+        return op_display_help(bs)
+    elif op == "display_lock":
+        return op_display_lock(bs)
+    elif op == "force_lock":
+        return op_force_lock(bs)
+    elif op == "cursor_prompt":
+        return op_cursor_prompt(bs, text)
+    
+    return f"Unknown operation: {op}"
+
+# ─── Web UI ─────────────────────────────────────────────────────────
+HTML = """<!DOCTYPE html>
+<html><head><title>Cursor Daemon</title>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font:13px/1.5 system-ui,sans-serif;background:#111;color:#ccc;max-width:900px;margin:0 auto;padding:16px}}
+h1{{color:#0f0;margin-bottom:16px}}
+h2{{color:#fff;margin:16px 0 8px;font-size:15px}}
+.card{{background:#1a1a1a;border-radius:8px;padding:14px;margin-bottom:12px}}
+.row{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
+input,select,button{{padding:6px 10px;border:1px solid #333;border-radius:4px;background:#222;color:#ddd;font-size:12px}}
+button{{background:#0a0;color:#000;cursor:pointer}}
+button.danger{{background:#a00;color:#fff;font-size:11px;padding:4px 8px}}
+button.small{{font-size:10px;padding:2px 6px}}
+select{{min-width:180px}}
+.badge{{padding:2px 8px;border-radius:4px;font-size:11px}}
+.badge-on{{background:#0a0;color:#000}}
+.badge-off{{background:#333;color:#888}}
+.log-entry{{font:10px monospace;padding:1px 0;border-bottom:1px solid #222}}
+table{{width:100%;border-collapse:collapse;font-size:12px}}
+th,td{{padding:4px 8px;text-align:left;border-bottom:1px solid #222}}
+th{{color:#888;font-weight:normal}}
+td input{{width:100%;background:#111;border:1px solid #333;padding:3px 6px}}
+.add-form{{display:flex;gap:8px;margin-bottom:16px}}
+.add-form input{{flex:1}}
+</style></head><body>
+<h1>🖥️ Cursor Daemon</h1>
+
+<div class="card">
+<h3>➕ Add Bot</h3>
+<form class="add-form" method="POST" action="/add">
+<input name="name" placeholder="Bot name (e.g. cursor-3)" required>
+<input name="token" placeholder="Telegram bot token" required>
+<select name="project"><option value="">— Select project —</option>
+{project_options}
+</select>
+<button type="submit">Add</button>
+</form>
+</div>
+
+{bot_cards}
+
+<div class="card">
+<h3>📋 Recent Logs</h3>
+{log_entries}
+</div>
+
+<script>setTimeout(()=>location.reload(),15000)</script>
+</body></html>"""
+
+BOT_CARD = """<div class="card">
+<h3>🤖 {name} <span class="badge badge-on">● {project}</span></h3>
+<div class="row" style="margin-bottom:8px">
+<form method="POST" action="/assign" style="display:inline">
+<input type="hidden" name="token" value="{token}">
+<select name="project" onchange="this.form.submit()">
+<option value="">— Unassigned —</option>
+{proj_opts}
+</select>
+</form>
+<form method="POST" action="/remove" style="display:inline" onsubmit="return confirm('Delete {name}?')">
+<input type="hidden" name="token" value="{token}">
+<button class="danger">✕</button>
+</form>
+</div>
+<details>
+<summary style="cursor:pointer;color:#888;font-size:12px">📖 Mappings ({map_count}) — click to edit</summary>
+<form method="POST" action="/save_mappings" style="margin-top:8px">
+<input type="hidden" name="token" value="{token}">
+<table>
+<tr><th>Telegram command</th><th>→ Operation</th><th></th></tr>
+{mapping_rows}
+</table>
+<div style="margin-top:8px">
+<input name="new_cmd" placeholder="New command" style="width:140px">
+<select name="new_op">
+{op_options}
+</select>
+<button type="submit" name="action" value="add">+ Add</button>
+<button type="submit" name="action" value="save" style="background:#08f">💾 Save All</button>
+</div>
+</form>
+</details>
+</div>"""
+
+def get_operations():
+    return [
+        ("display_projects", "List projects"),
+        ("select_project_1", "Select project 1"),
+        ("select_project_2", "Select project 2"),
+        ("select_project_3", "Select project 3"),
+        ("select_project_4", "Select project 4"),
+        ("select_project_5", "Select project 5"),
+        ("select_project_6", "Select project 6"),
+        ("select_project_7", "Select project 7"),
+        ("select_project_8", "Select project 8"),
+        ("select_project_9", "Select project 9"),
+        ("select_project_10", "Select project 10"),
+        ("select_project_11", "Select project 11"),
+        ("select_project_12", "Select project 12"),
+        ("select_project_13", "Select project 13"),
+        ("mode_agent", "Mode: agent"),
+        ("mode_plan", "Mode: plan"),
+        ("mode_ask", "Mode: ask"),
+        ("mode_shell", "Mode: shell"),
+        ("mode_plan_on", "Plan on (shortcut)"),
+        ("mode_plan_off", "Plan off (shortcut)"),
+        ("display_status", "Show status"),
+        ("display_help", "Show help"),
+        ("display_lock", "Show lock"),
+        ("force_lock", "Force lock override"),
+        ("cursor_prompt", "Pass to Cursor Agent"),
+    ]
+
+# ─── Web handlers ───────────────────────────────────────────────────
+async def web_ui(request):
+    from aiohttp import web
+    state = load_state()
+    projects = sorted([d.name for d in WORK_DIR.iterdir() if d.is_dir() and not d.name.startswith(".")])
+    proj_opts_tmpl = "\n".join(f'<option value=\"{p}\">{p}</option>' for p in projects)
+    ops = get_operations()
+    op_options = "\n".join(f'<option value=\"{op}\">{op}</option>' for op, _ in ops)
+    
+    cards = []
+    for token, bot in state.get("bots", {}).items():
+        name = html.escape(bot.get("name", "?"))
+        proj = html.escape(bot.get("project", "—"))
+        mappings = bot.get("mappings", {})
+        map_rows = ""
+        for cmd, op in sorted(mappings.items()):
+                        sel = op_options.replace('value="' + op + '"', 'value="' + op + '" selected')
+            map_rows += f'<tr><td><input name="cmd_{html.escape(cmd)}" value="{html.escape(cmd)}"></td><td><select name="op_{html.escape(cmd)}">{sel}</select></td><td><button class="danger small" formmethod="POST" formaction="/delete_mapping" name="cmd" value="{html.escape(cmd)}">✕</button></td></tr>'
+        card = BOT_CARD.format(
+            name=name, token=html.escape(token), project=proj,
+            proj_opts=proj_opts_tmpl.replace(f'value=\"{proj}\"', f'value=\"{proj}\" selected') if proj != "—" else proj_opts_tmpl,
+            map_count=len(mappings), mapping_rows=map_rows, op_options=op_options
+        )
+        cards.append(card)
+    
+    logs = state.get("logs", [])[-40:]
+    log_html = ""
+    for entry in reversed(logs):
+        cls = "log-error" if entry.get("level") == "error" else ""
+        t = entry.get("time", "")[11:19]
+        log_html += f'<div class=\"log-entry {cls}\">{t} {html.escape(entry.get(\"msg\", \"\"))}</div>\n'
+    
+    html_content = HTML.format(
+        project_options=proj_opts_tmpl,
+        bot_cards="\n".join(cards) or "<p style='color:#888'>No bots added.</p>",
+        log_entries=log_html or "<p style='color:#888'>No logs yet.</p>"
+    )
+    return web.Response(text=html_content, content_type="text/html")
+
+async def web_add(request):
+    from aiohttp import web
+    data = await request.post()
+    name = (data.get("name") or "").strip()
+    token = (data.get("token") or "").strip()
+    project = (data.get("project") or "").strip()
+    if not name or not token:
+        return web.Response(text="Name and token required", status=400)
+    state = load_state()
+    state["bots"][token] = {"name": name, "project": project, "last_command": "", "mappings": dict(DEFAULT_MAPPINGS)}
+    save_state(state)
+    log(state, f"Bot added: {name}")
+    raise web.HTTPFound("/")
+
+async def web_remove(request):
+    from aiohttp import web
+    data = await request.post()
+    token = (data.get("token") or "").strip()
+    state = load_state()
+    if token in state.get("bots", {}):
+        name = state["bots"][token]["name"]
+        del state["bots"][token]
+        save_state(state)
+        log(state, f"Bot removed: {name}")
+    raise web.HTTPFound("/")
+
+async def web_assign(request):
+    from aiohttp import web
+    data = await request.post()
+    token = (data.get("token") or "").strip()
+    project = (data.get("project") or "").strip()
+    state = load_state()
+    if token in state.get("bots", {}):
+        state["bots"][token]["project"] = project
+        save_state(state)
+    raise web.HTTPFound("/")
+
+async def web_save_mappings(request):
+    from aiohttp import web
+    data = await request.post()
+    token = (data.get("token") or "").strip()
+    action = data.get("action", "save")
+    state = load_state()
+    if token not in state.get("bots", {}):
+        raise web.HTTPFound("/")
+    bot = state["bots"][token]
+    mappings = bot.get("mappings", {})
+    
+    if action == "add":
+        new_cmd = (data.get("new_cmd") or "").strip().lower()
+        new_op = (data.get("new_op") or "").strip()
+        if new_cmd and new_op:
+            mappings[new_cmd] = new_op
+            log(state, f"Mapped: '{new_cmd}' → {new_op}")
+    elif action == "save":
+        new_mappings = {}
+        for key in data:
+            if key.startswith("cmd_") and data[key].strip():
+                cmd_name = key[4:]
+                op_key = f"op_{cmd_name}"
+                op_val = data.get(op_key, "").strip()
+                if op_val:
+                    new_mappings[cmd_name] = op_val
+        if new_mappings:
+            mappings = new_mappings
+            log(state, "Mappings saved")
+    
+    bot["mappings"] = mappings
+    save_state(state)
+    raise web.HTTPFound("/")
+
+async def web_delete_mapping(request):
+    from aiohttp import web
+    data = await request.post()
+    token = (data.get("token") or "").strip()
+    cmd = (data.get("cmd") or "").strip().lower()
+    state = load_state()
+    if token in state.get("bots", {}) and cmd in state["bots"][token].get("mappings", {}):
+        del state["bots"][token]["mappings"][cmd]
+        save_state(state)
+        log(state, f"Mapping deleted: '{cmd}'")
+    raise web.HTTPFound("/")
+
+# ─── Telegram ───────────────────────────────────────────────────────
+async def send_telegram(token, chat_id, text):
+    import aiohttp
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(url, json={"chat_id": chat_id, "text": text[:4096]}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                return await resp.json()
+        except Exception as e:
+            print(f"Telegram error: {e}")
+
+async def handle_message(token, bot_name, text, chat_id, state):
+    bot = bot_state(state, token)
+    
+    # Try dispatch
+    result = dispatch(bot, text)
+    
+    if result is not None:
+        bot["last_command"] = text
+        save_state(state)
+        proj = bot.get("project", "—")
+        log(state, f"[{bot_name}:{proj}] ↦ {text[:40]}")
+        await send_telegram(token, chat_id, result)
+    else:
+        log(state, f"[{bot_name}] ✗ Unknown: {text[:40]}")
+        await send_telegram(token, chat_id, f"❌ Unknown command: {text}\n\nType 'help' for available commands.")
+
+async def poll_bot(token, state):
+    import aiohttp
+    offset = 0
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    bot_info = state["bots"].get(token, {})
+    bot_name = bot_info.get("name", "unknown")
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params={"offset": offset, "timeout": 30, "allowed_updates": ["message"]}, timeout=aiohttp.ClientTimeout(total=35)) as resp:
+                    data = await resp.json()
+            if data.get("ok"):
+                for update in data["result"]:
+                    offset = update["update_id"] + 1
+                    msg = update.get("message", {})
+                    text = msg.get("text", "")
+                    chat_id = msg.get("chat", {}).get("id")
+                    if text and chat_id:
+                        await handle_message(token, bot_name, text, chat_id, state)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"Poll error {bot_name}: {e}")
+            await asyncio.sleep(5)
+
+# ─── Main ───────────────────────────────────────────────────────────
+async def main():
+    from aiohttp import web
+    state = load_state()
+    log(state, "Daemon v2 starting...")
+    
+    app = web.Application()
+    app.router.add_get("/", web_ui)
+    app.router.add_post("/add", web_add)
+    app.router.add_post("/remove", web_remove)
+    app.router.add_post("/assign", web_assign)
+    app.router.add_post("/save_mappings", web_save_mappings)
+    app.router.add_post("/delete_mapping", web_delete_mapping)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, HOST, PORT)
+    await site.start()
+    log(state, f"Web UI: http://{HOST}:{PORT}")
+    
+    tasks = []
+    for token in state.get("bots", {}):
+        tasks.append(asyncio.create_task(poll_bot(token, state)))
+    log(state, f"Polling {len(tasks)} bot(s)")
+    
+    try:
+        await asyncio.Event().wait()
+    except KeyboardInterrupt:
+        log(state, "Shutting down...")
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await runner.cleanup()
+
+if __name__ == "__main__":
+    asyncio.run(main())
