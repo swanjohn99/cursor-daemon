@@ -219,6 +219,21 @@ def _force_lock(bs):
     _write_lock(lockd, bs.get("name", "daemon"))
     return "Lock acquired (forced)."
 
+def _agent_env():
+    """Env for Cursor agent subprocess; cap Node heap at 1GB."""
+    env = {**os.environ, "HOME": "/home/ubuntu"}
+    heap = "--max-old-space-size=1024"
+    existing = env.get("NODE_OPTIONS", "").strip()
+    if "--max-old-space-size=" in existing:
+        parts = [p for p in existing.split() if not p.startswith("--max-old-space-size=")]
+        parts.append(heap)
+        env["NODE_OPTIONS"] = " ".join(parts)
+    elif existing:
+        env["NODE_OPTIONS"] = existing + " " + heap
+    else:
+        env["NODE_OPTIONS"] = heap
+    return env
+
 def _cursor(bs, text):
     p = bs.get("project", "")
     if not p:
@@ -250,7 +265,7 @@ def _cursor(bs, text):
     bs["_shell_cmd"] = shlex.join(cmd)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
-                          cwd=str(pd), env={**os.environ, "HOME": "/home/ubuntu"})
+                          cwd=str(pd), env=_agent_env())
         return (r.stdout or r.stderr).strip() or "(empty response)"
     except subprocess.TimeoutExpired:
         return "Cursor Agent timed out (120s)."
