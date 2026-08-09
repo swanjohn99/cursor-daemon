@@ -1,1 +1,6 @@
-state.json\n*.bak\n*.ogg\n__pycache__/\n*.pyc
+state.json
+*.bak
+*.sam-bak
+*.ogg
+__pycache__/
+*.pyc

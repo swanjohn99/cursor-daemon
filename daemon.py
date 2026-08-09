@@ -2,9 +2,12 @@
 """
 Cursor Daemon v2 — Named operations, web-mapped commands, zero-token relay.
 """
-import asyncio, json, os, subprocess, html, shutil
+import asyncio, json, os, subprocess, html, shutil, tempfile, re, shlex
 from pathlib import Path
 from datetime import datetime, timezone
+
+EDGE_VOICE = "en-US-AriaNeural"
+TTS_MAX_CHARS = 3000
 
 import asyncio as _asyncio
 _state_lock = _asyncio.Lock()
@@ -136,8 +139,14 @@ def _move_project(bs, name):
     return "Now in: %s\n\nUse 'cursor <prompt>' to talk to Cursor Agent. Type 'projects' to switch." % name
 
 # Operations
+def _projects():
+    return sorted([
+        d.name for d in WORK_DIR.iterdir()
+        if d.is_dir() and not d.name.startswith(".") and d.name != "cursor-daemon"
+    ])
+
 def _projects_list():
-    projs = sorted([d.name for d in WORK_DIR.iterdir() if d.is_dir() and not d.name.startswith(".") and d.name != "cursor-daemon"])
+    projs = _projects()
     if not projs:
         return "No projects found."
     lines = ["Select a project:", ""]
@@ -148,7 +157,7 @@ def _projects_list():
     return "\n".join(lines)
 
 def _select(bs, num):
-    projs = sorted([d.name for d in WORK_DIR.iterdir() if d.is_dir() and not d.name.startswith(".") and d.name != "cursor-daemon"])
+    projs = _projects()
     if num < 1 or num > len(projs):
         return "Invalid. Pick 1-%d." % len(projs)
     return _move_project(bs, projs[num - 1])
@@ -157,7 +166,12 @@ def _status(bs):
     p = bs.get("project", "none")
     m = bs.get("current_mode", "agent")
     mdl = bs.get("current_model", "(default)")
-    return "Project: %s\nPath: %s\nModel: %s\nMode: %s" % (p, WORK_DIR / p if p != "none" else "-", mdl, m)
+    voice = "ON" if bs.get("voice_enabled") else "OFF"
+    yolo = "ON" if bs.get("yolo_enabled") else "OFF"
+    return (
+        "Project: %s\nPath: %s\nModel: %s\nMode: %s\nVoice: %s\nYOLO: %s"
+        % (p, WORK_DIR / p if p != "none" else "-", mdl, m, voice, yolo)
+    )
 
 def _help(bs):
     return """AVAILABLE COMMANDS:
@@ -177,15 +191,12 @@ MODE:
 SETTINGS:
   model <name>          - set Cursor model
   status                - current state
+  yolo on / yolo off    - toggle --yolo for Cursor
+  voice on / voice off  - toggle TTS for Cursor responses
 
 LOCKS:
   lock                  - show lock status
   force                 - override stale lock
-
-  yolo on / yolo off    - toggle --yolo for Cursor
-
-VOICE:
-  voice on / voice off  - toggle TTS for Cursor responses
 
   help                  - show this message""" 
 
@@ -218,13 +229,15 @@ def _cursor(bs, text):
     mode = bs.get("current_mode", "agent")
     model = bs.get("current_model", "")
     if mode == "shell":
+        cmd = ["bash", "-c", text]
+        bs["_shell_cmd"] = shlex.join(cmd)
         try:
-            r = subprocess.run(["bash", "-c", text], capture_output=True, text=True,
+            r = subprocess.run(cmd, capture_output=True, text=True,
                               timeout=30, cwd=str(pd), env={**os.environ, "HOME": "/home/ubuntu"})
             return r.stdout.strip() or r.stderr.strip() or "(empty)"
         except subprocess.TimeoutExpired:
             return "Command timed out (30s)."
-    cmd = [str(CLI), "-p"]
+    cmd = [str(CLI), "-p", "--continue"]
     if bs.get("yolo_enabled"):
         cmd.append("--yolo")
     if mode == "plan":
@@ -234,6 +247,7 @@ def _cursor(bs, text):
     if model:
         cmd.extend(["--model", model])
     cmd.append(text)
+    bs["_shell_cmd"] = shlex.join(cmd)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
                           cwd=str(pd), env={**os.environ, "HOME": "/home/ubuntu"})
@@ -243,10 +257,17 @@ def _cursor(bs, text):
     except Exception as e:
         return "Error: %s" % e
 
+def _cursor_prompt(text):
+    """Return prompt text if this message invokes Cursor, else None."""
+    raw_lower = text.lower()
+    m = re.match(r'^cursor[,.:;!?\s]+(.+)', raw_lower)
+    if m:
+        return text[m.start(1):].strip()
+    return None
+
 def dispatch(s, bs, text):
-    lower = text.lower().strip()
-    lower = lower.rstrip(",.?!:;")  # strip trailing punctuation
-# voice commands
+    lower = text.lower().strip().rstrip(",.?!:;")
+    # voice commands
     if lower == "voice on":
         bs["voice_enabled"] = True
         return "Voice: ON"
@@ -262,13 +283,11 @@ def dispatch(s, bs, text):
         return "YOLO: OFF"
 
     # cursor <prompt> → agent -p (before dict lookup)
-    import re
-    raw_lower = text.lower()
-    m = re.match(r'^cursor[,.:;!?\s]+(.+)', raw_lower)
-    if m:
-        prompt = text[m.start(1):].strip()
+    prompt = _cursor_prompt(text)
+    if prompt is not None:
+        bs["_speak"] = True
         return _cursor(bs, prompt)
-    if raw_lower.strip() == "cursor":
+    if text.lower().strip() == "cursor":
         return "Usage: cursor <prompt>"
     if lower.startswith("model "):
         mn = text.split(" ", 1)[1].strip() if " " in text else ""
@@ -307,6 +326,7 @@ def dispatch(s, bs, text):
     elif op == "force_lock":
         return _force_lock(bs)
     elif op == "cursor_prompt":
+        bs["_speak"] = True
         return _cursor(bs, text)
     return "Unknown op: %s" % op
 
@@ -329,7 +349,11 @@ button.save{{background:#08f}}
 select{{min-width:180px}}
 .badge{{padding:2px 8px;border-radius:4px;font-size:11px}}
 .badge-on{{background:#0a0;color:#000}}
-.log-entry{{font:10px monospace;padding:1px 0;border-bottom:1px solid #222}}
+.log-head{{display:flex;align-items:center;gap:8px;margin-bottom:8px}}
+.log-head h3{{margin:0}}
+.log-hint{{color:#666;font-size:11px}}
+.log-card{{width:calc(100vw - 32px);max-width:none;margin-left:calc(50% - 50vw + 16px);box-sizing:border-box}}
+.log-entry{{font:10px monospace;padding:1px 0;border-bottom:1px solid #222;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 .log-error{{color:#f44}}
 table{{width:100%;border-collapse:collapse;font-size:12px}}
 th,td{{padding:4px 8px;text-align:left;border-bottom:1px solid #222}}
@@ -352,12 +376,24 @@ td input{{width:100%;background:#111;border:1px solid #333;padding:3px 6px}}
 
 {bot_cards}
 
-<div class="card">
+<div class="card log-card">
+<div class="log-head">
 <h3>📋 Recent Logs</h3>
+<button type="button" class="small" onclick="location.reload()">Refresh</button>
+<span class="log-hint">(r)</span>
+</div>
 {log_entries}
 </div>
 
-<script>setTimeout(function(){{location.reload()}},15000)</script>
+<script>
+document.addEventListener("keydown",function(e){{
+  if(e.key!=="r"&&e.key!=="R")return;
+  var t=e.target&&e.target.tagName;
+  if(t==="INPUT"||t==="SELECT"||t==="TEXTAREA")return;
+  e.preventDefault();
+  location.reload();
+}});
+</script>
 </body></html>"""
 
 BOT_CARD = """<div class="card">
@@ -578,17 +614,93 @@ async def send_tg(token, chat_id, text):
     except Exception as e:
         print("Telegram error: %s" % e)
 
+def _tts_plain(text):
+    """Strip light markdown/code noise so TTS sounds cleaner."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    t = re.sub(r"```[\s\S]*?```", " ", t)
+    t = re.sub(r"`([^`]+)`", r"\1", t)
+    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
+    t = re.sub(r"[*_~>#]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    if len(t) > TTS_MAX_CHARS:
+        t = t[:TTS_MAX_CHARS] + "…"
+    return t
+
+async def _edge_tts_ogg(text):
+    """Synthesize text via edge-tts → mp3 → ogg/opus. Returns ogg path or None."""
+    import edge_tts
+    speak = _tts_plain(text)
+    if not speak:
+        return None
+    tmp = tempfile.mkdtemp(prefix="cursor-tts-")
+    mp3_path = os.path.join(tmp, "speech.mp3")
+    ogg_path = os.path.join(tmp, "speech.ogg")
+    try:
+        await edge_tts.Communicate(speak, EDGE_VOICE).save(mp3_path)
+        r = await asyncio.to_thread(
+            subprocess.run,
+            ["ffmpeg", "-i", mp3_path, "-acodec", "libopus",
+             "-ac", "1", "-b:a", "48k", "-vbr", "on",
+             "-application", "voip", "-compression_level", "10",
+             "-f", "ogg", ogg_path, "-y"],
+            capture_output=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+        if r.returncode == 0 and os.path.exists(ogg_path) and os.path.getsize(ogg_path) > 0:
+            return ogg_path
+        err = (r.stderr or b"")[:200]
+        print("ffmpeg TTS failed: %s" % err)
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None
+    except Exception as e:
+        print("TTS error: %s" % e)
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None
+
+async def send_tg_voice(token, chat_id, text):
+    """Send Cursor reply as Telegram voice note. Falls back silently on failure."""
+    import aiohttp
+    ogg = await _edge_tts_ogg(text)
+    if not ogg:
+        return None
+    try:
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        with open(ogg, "rb") as fh:
+            form.add_field(
+                "voice", fh, filename="reply.ogg", content_type="audio/ogg",
+            )
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(
+                    "https://api.telegram.org/bot%s/sendVoice" % token,
+                    data=form,
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as resp:
+                    return await resp.json()
+    except Exception as e:
+        print("Telegram voice error: %s" % e)
+        return None
+    finally:
+        shutil.rmtree(os.path.dirname(ogg), ignore_errors=True)
+
 async def handle_message(token, bot_name, text, chat_id, state):
     bot = bot_state(state, token)
+    speak = False
     async with _state_lock:
         result = dispatch(state, bot, text)
+        speak = bool(bot.pop("_speak", False) and bot.get("voice_enabled"))
+        shell_cmd = bot.pop("_shell_cmd", None)
         if result is not None:
             bot["last_command"] = text
-            save_state(state)
             proj = bot.get("project", "-")
-            log(state, "[%s:%s] %s" % (bot_name, proj, text[:50]))
+            detail = shell_cmd if shell_cmd else text
+            log(state, "[%s:%s] %s" % (bot_name, proj, detail))
+            save_state(state)
     if result is not None:
         await send_tg(token, chat_id, result)
+        if speak:
+            await send_tg_voice(token, chat_id, result)
     else:
         log(state, "[%s] Unknown: %s" % (bot_name, text[:50]))
         await send_tg(token, chat_id,

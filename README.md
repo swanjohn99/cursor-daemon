@@ -41,7 +41,7 @@ systemctl --user start cursor-daemon
 - **Add bot** — name + Telegram token + optional project assignment
 - **Assign project** — dropdown per bot, saves instantly
 - **Remove bot** — ✕ button
-- **Logs** — last 50 entries, auto-refresh every 10s
+- **Logs** — last 40 entries, refresh via button or `r` key
 - No auth — protected by Tailscale network
 
 ## Commands
@@ -52,7 +52,7 @@ Same as Hermes passthrough relay:
 |---|---|
 | `1`–`13` | Select project by number |
 | `projects` / `back` / `go back` | Show project list |
-| `cursor <prompt>` | Send prompt to Cursor Agent (`agent -p`) |
+| `cursor <prompt>` | Send prompt to Cursor Agent (`agent -p --continue`) |
 | `plan on` / `plan off` | Toggle plan mode |
 | `mode agent` / `mode plan` / `mode ask` / `mode shell` | Switch Cursor mode |
 | `model <name>` | Set Cursor model |
