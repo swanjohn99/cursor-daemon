@@ -43,6 +43,8 @@ DM.update({
     "mode ask": "mode_ask", "mode shell": "mode_shell",
     "agent mode": "mode_agent", "plan mode": "mode_plan",
     "ask mode": "mode_ask", "shell mode": "mode_shell",
+    "new context": "new_context", "newcontext": "new_context",
+    "fresh context": "new_context", "fresh": "new_context",
 })
 
 OPS = [
@@ -52,6 +54,7 @@ OPS = [
     ("display_help", "Show help"),
     ("display_lock", "Show lock"),
     ("force_lock", "Force lock override"),
+    ("new_context", "Start new Cursor context"),
     ("mode_agent", "Mode: agent"),
     ("mode_plan", "Mode: plan"),
     ("mode_ask", "Mode: ask"),
@@ -68,7 +71,9 @@ def load_state():
         s = {}
     s.setdefault("bots", {})
     s.setdefault("logs", [])
-    s.setdefault("mappings", dict(DM))
+    mappings = s.setdefault("mappings", dict(DM))
+    for k, v in DM.items():
+        mappings.setdefault(k, v)
     return s
 
 def save_state(s):
@@ -90,6 +95,7 @@ def bot_state(s, token):
     b.setdefault("last_command", "")
     b.setdefault("voice_enabled", False)
     b.setdefault("yolo_enabled", False)
+    b.setdefault("continue_enabled", True)
     return b
 
 # Lock helpers
@@ -136,7 +142,11 @@ def _move_project(bs, name):
     _release_lock_if_ours(old_proj, bn)
     _write_lock(dest_lock, bn)
     bs["project"] = name
-    return "Now in: %s\n\nUse 'cursor <prompt>' to talk to Cursor Agent. Type 'projects' to switch." % name
+    bs["continue_enabled"] = False
+    return (
+        "Now in: %s\nContext: NEW (next cursor starts fresh)\n\n"
+        "Use 'cursor <prompt>' to talk to Cursor Agent. Type 'projects' to switch."
+    ) % name
 
 # Operations
 def _projects():
@@ -168,9 +178,10 @@ def _status(bs):
     mdl = bs.get("current_model", "(default)")
     voice = "ON" if bs.get("voice_enabled") else "OFF"
     yolo = "ON" if bs.get("yolo_enabled") else "OFF"
+    cont = "ON" if bs.get("continue_enabled", True) else "OFF (next cursor = new context)"
     return (
-        "Project: %s\nPath: %s\nModel: %s\nMode: %s\nVoice: %s\nYOLO: %s"
-        % (p, WORK_DIR / p if p != "none" else "-", mdl, m, voice, yolo)
+        "Project: %s\nPath: %s\nModel: %s\nMode: %s\nVoice: %s\nYOLO: %s\nContinue: %s"
+        % (p, WORK_DIR / p if p != "none" else "-", mdl, m, voice, yolo, cont)
     )
 
 def _help(bs):
@@ -182,6 +193,7 @@ PROJECTS:
 
 CURSOR:
   cursor <prompt>       - send prompt to Cursor Agent (-p)
+  new context / fresh   - next cursor starts without --continue
 
 MODE:
   mode agent / plan / ask / shell - switch mode
@@ -252,7 +264,10 @@ def _cursor(bs, text):
             return r.stdout.strip() or r.stderr.strip() or "(empty)"
         except subprocess.TimeoutExpired:
             return "Command timed out (30s)."
-    cmd = [str(CLI), "-p", "--continue"]
+    use_continue = bs.get("continue_enabled", True)
+    cmd = [str(CLI), "-p"]
+    if use_continue:
+        cmd.append("--continue")
     if bs.get("yolo_enabled"):
         cmd.append("--yolo")
     if mode == "plan":
@@ -263,10 +278,15 @@ def _cursor(bs, text):
         cmd.extend(["--model", model])
     cmd.append(text)
     bs["_shell_cmd"] = shlex.join(cmd)
+    # After first fresh prompt, resume this new context on later calls
+    bs["continue_enabled"] = True
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
                           cwd=str(pd), env=_agent_env())
-        return (r.stdout or r.stderr).strip() or "(empty response)"
+        out = (r.stdout or r.stderr).strip() or "(empty response)"
+        if not use_continue:
+            out = "[new context]\n" + out
+        return out
     except subprocess.TimeoutExpired:
         return "Cursor Agent timed out (120s)."
     except Exception as e:
@@ -340,6 +360,9 @@ def dispatch(s, bs, text):
         return _lock_status(bs)
     elif op == "force_lock":
         return _force_lock(bs)
+    elif op == "new_context":
+        bs["continue_enabled"] = False
+        return "Context: NEW (next cursor starts fresh; then --continue resumes it)"
     elif op == "cursor_prompt":
         bs["_speak"] = True
         return _cursor(bs, text)

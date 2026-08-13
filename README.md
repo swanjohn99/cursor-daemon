@@ -53,6 +53,7 @@ Same as Hermes passthrough relay:
 | `1`–`13` | Select project by number |
 | `projects` / `back` / `go back` | Show project list |
 | `cursor <prompt>` | Send prompt to Cursor Agent (`agent -p --continue`) |
+| `new context` / `fresh` | Next `cursor` omits `--continue`; then auto-resumes that thread |
 | `plan on` / `plan off` | Toggle plan mode |
 | `mode agent` / `mode plan` / `mode ask` / `mode shell` | Switch Cursor mode |
 | `model <name>` | Set Cursor model |
