@@ -54,8 +54,8 @@ Same as Hermes passthrough relay:
 | `projects` / `back` / `go back` | Show project list |
 | `cursor <prompt>` | Send prompt to Cursor Agent (`agent -p --continue`) |
 | `new context` / `fresh` | Next `cursor` omits `--continue`; then auto-resumes that thread |
-| `plan on` / `plan off` | Toggle plan mode |
-| `mode agent` / `mode plan` / `mode ask` / `mode shell` | Switch Cursor mode |
+| `plan on` / `plan off` | Toggle plan mode (new context) |
+| `mode agent` / `mode plan` / `mode ask` / `mode shell` | Switch Cursor mode (new context; `--continue` dropped) |
 | `model <name>` | Set Cursor model |
 | `status` | Current project, mode, model |
 | `lock` | Show lock status |

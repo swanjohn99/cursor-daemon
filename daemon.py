@@ -196,9 +196,9 @@ CURSOR:
   new context / fresh   - next cursor starts without --continue
 
 MODE:
-  mode agent / plan / ask / shell - switch mode
-  plan on / turn on plan          - plan mode
-  plan off / turn off plan        - back to agent
+  mode agent / plan / ask / shell - switch mode (new context)
+  plan on / turn on plan          - plan mode (new context)
+  plan off / turn off plan        - back to agent (new context)
 
 SETTINGS:
   model <name>          - set Cursor model
@@ -246,6 +246,20 @@ def _agent_env():
         env["NODE_OPTIONS"] = heap
     return env
 
+def _set_mode(bs, mode):
+    """Set mode. Cursor sessions lock their mode, so a change among
+    agent/plan/ask drops --continue (CLI has no --mode agent; agent = omit flag)."""
+    prev = bs.get("current_mode", "agent")
+    bs["current_mode"] = mode
+    cursor_modes = ("agent", "plan", "ask")
+    if mode in cursor_modes and prev != mode:
+        bs["continue_enabled"] = False
+        return (
+            "Mode: %s\nContext: NEW (next cursor starts fresh in %s; "
+            "then --continue resumes it)"
+        ) % (mode, mode)
+    return "Mode: %s" % mode
+
 def _cursor(bs, text):
     p = bs.get("project", "")
     if not p:
@@ -274,6 +288,8 @@ def _cursor(bs, text):
         cmd.append("--plan")
     elif mode == "ask":
         cmd.extend(["--mode", "ask"])
+    # agent = omit --mode (CLI choices are only plan|ask; --continue of an
+    # ask/plan session would keep that mode, so _set_mode drops continue)
     if model:
         cmd.extend(["--model", model])
     cmd.append(text)
@@ -344,14 +360,11 @@ def dispatch(s, bs, text):
     elif op.startswith("select_project_"):
         return _select(bs, int(op.rsplit("_", 1)[-1]))
     elif op in ("mode_agent", "mode_plan", "mode_ask", "mode_shell"):
-        bs["current_mode"] = op.split("_", 1)[-1]
-        return "Mode: %s" % bs["current_mode"]
+        return _set_mode(bs, op.split("_", 1)[-1])
     elif op == "mode_plan_on":
-        bs["current_mode"] = "plan"
-        return "Mode: plan"
+        return _set_mode(bs, "plan")
     elif op == "mode_plan_off":
-        bs["current_mode"] = "agent"
-        return "Mode: agent"
+        return _set_mode(bs, "agent")
     elif op == "display_status":
         return _status(bs)
     elif op == "display_help":
