@@ -317,7 +317,8 @@ def _cursor_prompt(text):
     return None
 
 def dispatch(s, bs, text):
-    lower = text.lower().strip().rstrip(",.?!:;")
+    # Collapse internal whitespace so "mode    agent" matches "mode agent"
+    lower = " ".join(text.lower().strip().rstrip(",.?!:;").split())
     # voice commands
     if lower == "voice on":
         bs["voice_enabled"] = True
@@ -338,10 +339,10 @@ def dispatch(s, bs, text):
     if prompt is not None:
         bs["_speak"] = True
         return _cursor(bs, prompt)
-    if text.lower().strip() == "cursor":
+    if lower == "cursor":
         return "Usage: cursor <prompt>"
     if lower.startswith("model "):
-        mn = text.split(" ", 1)[1].strip() if " " in text else ""
+        mn = lower.split(" ", 1)[1] if " " in lower else ""
         if mn:
             bs["current_model"] = mn
             return "Model: %s" % mn
