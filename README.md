@@ -50,7 +50,7 @@ Same as Hermes passthrough relay:
 
 | Command | Does |
 |---|---|
-| `1`–`13` | Select project by number |
+| `1`–`13` | Select project by number (new context, mode reset to agent) |
 | `projects` / `back` / `go back` | Show project list |
 | `cursor <prompt>` | Send prompt to Cursor Agent (`agent -p --continue`) |
 | `new context` / `fresh` | Next `cursor` omits `--continue`; then auto-resumes that thread |

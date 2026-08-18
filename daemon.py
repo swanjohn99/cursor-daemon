@@ -143,6 +143,7 @@ def _move_project(bs, name):
     _write_lock(dest_lock, bn)
     bs["project"] = name
     bs["continue_enabled"] = False
+    bs["current_mode"] = "agent"
     return (
         "Now in: %s\nContext: NEW (next cursor starts fresh)\n\n"
         "Use 'cursor <prompt>' to talk to Cursor Agent. Type 'projects' to switch."
@@ -248,12 +249,16 @@ def _agent_env():
 
 def _set_mode(bs, mode):
     """Set mode. Cursor sessions lock their mode, so a change among
-    agent/plan/ask drops --continue (CLI has no --mode agent; agent = omit flag)."""
+    agent/plan/ask drops --continue (CLI has no --mode agent; agent = omit flag).
+    Skip a second NEW banner if continue is already queued off."""
     prev = bs.get("current_mode", "agent")
     bs["current_mode"] = mode
     cursor_modes = ("agent", "plan", "ask")
     if mode in cursor_modes and prev != mode:
+        already_new = not bs.get("continue_enabled", True)
         bs["continue_enabled"] = False
+        if already_new:
+            return "Mode: %s" % mode
         return (
             "Mode: %s\nContext: NEW (next cursor starts fresh in %s; "
             "then --continue resumes it)"
