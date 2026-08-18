@@ -189,7 +189,7 @@ def _help(bs):
     return """AVAILABLE COMMANDS:
 
 PROJECTS:
-  N (1-13)              - select project N
+  N (1-13)              - select project N (new context, agent mode)
   projects / back       - show project list
 
 CURSOR:
