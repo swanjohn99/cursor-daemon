@@ -302,14 +302,14 @@ def _cursor(bs, text):
     # After first fresh prompt, resume this new context on later calls
     bs["continue_enabled"] = True
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
                           cwd=str(pd), env=_agent_env())
         out = (r.stdout or r.stderr).strip() or "(empty response)"
         if not use_continue:
             out = "[new context]\n" + out
         return out
     except subprocess.TimeoutExpired:
-        return "Cursor Agent timed out (120s)."
+        return "Cursor Agent timed out (5m)."
     except Exception as e:
         return "Error: %s" % e
 
