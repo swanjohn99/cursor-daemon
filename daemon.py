@@ -19,15 +19,8 @@ STATE_FILE = Path("/home/ubuntu/.cursor-daemon/state.json")
 WORK_DIR = Path("/home/ubuntu/work")
 CLI = Path("/home/ubuntu/.local/bin/agent")
 
-# Default command mappings
-DM = {}
-for i in range(1, 14):
-    DM[str(i)] = "select_project_%d" % i
-    DM["switch to %d" % i] = "select_project_%d" % i
-    DM["go to %d" % i] = "select_project_%d" % i
-    DM["select %d" % i] = "select_project_%d" % i
-    DM["project %d" % i] = "select_project_%d" % i
-DM.update({
+# Default command mappings (project numbers synced from ~/work at load / `projects`)
+DM = {
     "projects": "display_projects", "back": "display_projects",
     "go back": "display_projects", "menu": "display_projects",
     "show projects": "display_projects", "list projects": "display_projects",
@@ -45,9 +38,9 @@ DM.update({
     "ask mode": "mode_ask", "shell mode": "mode_shell",
     "new context": "new_context", "newcontext": "new_context",
     "fresh context": "new_context", "fresh": "new_context",
-})
+}
 
-OPS = [
+_OPS_BASE = [
     ("display_projects", "List projects"),
     ("cursor_prompt", "Pass to Cursor Agent"),
     ("display_status", "Show status"),
@@ -61,7 +54,9 @@ OPS = [
     ("mode_shell", "Mode: shell"),
     ("mode_plan_on", "Plan on (shortcut)"),
     ("mode_plan_off", "Plan off (shortcut)"),
-] + [("select_project_%d" % i, "Select project %d" % i) for i in range(1, 14)]
+]
+
+_SELECT_PHRASES = ("%d", "switch to %d", "go to %d", "select %d", "project %d")
 
 # State
 def load_state():
@@ -74,6 +69,7 @@ def load_state():
     mappings = s.setdefault("mappings", dict(DM))
     for k, v in DM.items():
         mappings.setdefault(k, v)
+    _sync_project_mappings(s)
     return s
 
 def save_state(s):
@@ -151,10 +147,48 @@ def _move_project(bs, name):
 
 # Operations
 def _projects():
+    if not WORK_DIR.is_dir():
+        return []
     return sorted([
         d.name for d in WORK_DIR.iterdir()
         if d.is_dir() and not d.name.startswith(".") and d.name != "cursor-daemon"
     ])
+
+def _select_keys(i):
+    return [p % i for p in _SELECT_PHRASES]
+
+def _sync_project_mappings(s):
+    """Keep 1..N select mappings in state in sync with live ~/work dirs."""
+    n = len(_projects())
+    mappings = s.setdefault("mappings", {})
+    drop = []
+    for k, v in mappings.items():
+        if not (isinstance(v, str) and v.startswith("select_project_")):
+            continue
+        try:
+            num = int(v.rsplit("_", 1)[-1])
+        except ValueError:
+            continue
+        if k not in _select_keys(num):
+            continue
+        if num < 1 or num > n:
+            drop.append(k)
+    changed = bool(drop)
+    for k in drop:
+        del mappings[k]
+    for i in range(1, n + 1):
+        op = "select_project_%d" % i
+        for k in _select_keys(i):
+            if mappings.get(k) != op:
+                mappings[k] = op
+                changed = True
+    return changed
+
+def _ops():
+    n = len(_projects())
+    return _OPS_BASE + [
+        ("select_project_%d" % i, "Select project %d" % i) for i in range(1, n + 1)
+    ]
 
 def _projects_list():
     projs = _projects()
@@ -186,10 +220,12 @@ def _status(bs):
     )
 
 def _help(bs):
+    n = len(_projects())
+    rng = "1-%d" % n if n else "none"
     return """AVAILABLE COMMANDS:
 
 PROJECTS:
-  N (1-13)              - select project N (new context, agent mode)
+  N (%s)              - select project N (new context, agent mode)
   projects / back       - show project list
 
 CURSOR:
@@ -211,7 +247,7 @@ LOCKS:
   lock                  - show lock status
   force                 - override stale lock
 
-  help                  - show this message""" 
+  help                  - show this message""" % rng 
 
 def _lock_status(bs):
     p = bs.get("project", "")
@@ -362,6 +398,7 @@ def dispatch(s, bs, text):
     if not op:
         return None
     if op == "display_projects":
+        _sync_project_mappings(s)
         return _projects_list()
     elif op.startswith("select_project_"):
         return _select(bs, int(op.rsplit("_", 1)[-1]))
@@ -476,7 +513,7 @@ async def web_ui(request):
     s = load_state()
     projects = sorted([d.name for d in WORK_DIR.iterdir() if d.is_dir() and not d.name.startswith(".")])
     proj_opts = "\n".join('<option value="%s">%s</option>' % (p, p) for p in projects)
-    op_opts = "\n".join('<option value="%s">%s</option>' % (o, lb) for o, lb in OPS)
+    op_opts = "\n".join('<option value="%s">%s</option>' % (o, lb) for o, lb in _ops())
     
     cards = []
     for tok, bot in s.get("bots", {}).items():
@@ -795,6 +832,7 @@ async def poll_bot(token, state):
 async def main():
     from aiohttp import web
     s = load_state()
+    save_state(s)
     log(s, "Daemon v2 starting...")
     
     app = web.Application()
