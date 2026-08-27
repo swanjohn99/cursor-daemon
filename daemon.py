@@ -233,9 +233,9 @@ CURSOR:
   new context / fresh   - next cursor starts without --continue
 
 MODE:
-  mode agent / plan / ask / shell - switch mode (new context)
-  plan on / turn on plan          - plan mode (new context)
-  plan off / turn off plan        - back to agent (new context)
+  mode agent / ask / shell        - switch mode (same context)
+  mode plan / plan on             - plan mode (new context)
+  plan off / turn off plan        - back to agent (same context)
 
 SETTINGS:
   model <name>          - set Cursor model
@@ -284,13 +284,12 @@ def _agent_env():
     return env
 
 def _set_mode(bs, mode):
-    """Set mode. Cursor sessions lock their mode, so a change among
-    agent/plan/ask drops --continue (CLI has no --mode agent; agent = omit flag).
-    Skip a second NEW banner if continue is already queued off."""
+    """Set mode. Entering plan drops --continue (plan wants a fresh thread).
+    Ask/agent/shell keep the current thread. Skip a second NEW banner if
+    continue is already queued off."""
     prev = bs.get("current_mode", "agent")
     bs["current_mode"] = mode
-    cursor_modes = ("agent", "plan", "ask")
-    if mode in cursor_modes and prev != mode:
+    if mode == "plan" and prev != "plan":
         already_new = not bs.get("continue_enabled", True)
         bs["continue_enabled"] = False
         if already_new:
@@ -329,8 +328,7 @@ def _cursor(bs, text):
         cmd.append("--plan")
     elif mode == "ask":
         cmd.extend(["--mode", "ask"])
-    # agent = omit --mode (CLI choices are only plan|ask; --continue of an
-    # ask/plan session would keep that mode, so _set_mode drops continue)
+    # agent = omit --mode (CLI choices are only plan|ask)
     if model:
         cmd.extend(["--model", model])
     cmd.append(text)
