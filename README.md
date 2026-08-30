@@ -52,12 +52,12 @@ Same as Hermes passthrough relay:
 |---|---|
 | `1`–`13` | Select project by number (new context, mode reset to agent) |
 | `projects` / `back` / `go back` | Show project list |
-| `cursor <prompt>` | Send prompt to Cursor Agent (`agent -p --continue`) |
-| `new context` / `fresh` | Next `cursor` omits `--continue`; then auto-resumes that thread |
-| `plan on` | Plan mode (new context; `--continue` dropped) |
-| `plan off` | Back to agent (same context) |
-| `mode agent` / `mode ask` / `mode shell` | Switch Cursor mode (same context) |
-| `mode plan` | Plan mode (new context; `--continue` dropped) |
+| `cursor <prompt>` | Send prompt to Cursor Agent (`--resume` pinned thread) |
+| `new context` / `fresh` | Next `cursor` creates a new pinned thread |
+| `plan on` | Plan mode (new context) |
+| `plan off` | Back to agent (same thread; mode metadata reset) |
+| `mode agent` / `mode ask` / `mode shell` | Switch Cursor mode (same thread) |
+| `mode plan` | Plan mode (new context) |
 | `model <name>` | Set Cursor model |
 | `status` | Current project, mode, model |
 | `lock` | Show lock status |

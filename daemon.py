@@ -3,6 +3,7 @@
 Cursor Daemon v2 — Named operations, web-mapped commands, zero-token relay.
 """
 import asyncio, json, os, subprocess, html, shutil, tempfile, re, shlex
+import hashlib, sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -18,6 +19,13 @@ HOST = "0.0.0.0"
 STATE_FILE = Path("/home/ubuntu/.cursor-daemon/state.json")
 WORK_DIR = Path("/home/ubuntu/work")
 CLI = Path("/home/ubuntu/.local/bin/agent")
+CHATS_DIR = Path("/home/ubuntu/.cursor/chats")
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+    re.I,
+)
+# CLI session metadata: agent=default, ask=search, plan=plan
+_CLI_MODE = {"agent": "default", "ask": "search", "plan": "plan"}
 
 # Default command mappings (project numbers synced from ~/work at load / `projects`)
 DM = {
@@ -92,6 +100,7 @@ def bot_state(s, token):
     b.setdefault("voice_enabled", False)
     b.setdefault("yolo_enabled", False)
     b.setdefault("continue_enabled", True)
+    b.setdefault("chat_id", "")
     return b
 
 # Lock helpers
@@ -140,6 +149,7 @@ def _move_project(bs, name):
     bs["project"] = name
     bs["continue_enabled"] = False
     bs["current_mode"] = "agent"
+    bs["chat_id"] = ""
     return (
         "Now in: %s\nContext: NEW (next cursor starts fresh)\n\n"
         "Use 'cursor <prompt>' to talk to Cursor Agent. Type 'projects' to switch."
@@ -214,9 +224,11 @@ def _status(bs):
     voice = "ON" if bs.get("voice_enabled") else "OFF"
     yolo = "ON" if bs.get("yolo_enabled") else "OFF"
     cont = "ON" if bs.get("continue_enabled", True) else "OFF (next cursor = new context)"
+    cid = (bs.get("chat_id") or "").strip()
+    thread = cid[:8] if cid else "(none)"
     return (
-        "Project: %s\nPath: %s\nModel: %s\nMode: %s\nVoice: %s\nYOLO: %s\nContinue: %s"
-        % (p, WORK_DIR / p if p != "none" else "-", mdl, m, voice, yolo, cont)
+        "Project: %s\nPath: %s\nModel: %s\nMode: %s\nVoice: %s\nYOLO: %s\nContinue: %s\nThread: %s"
+        % (p, WORK_DIR / p if p != "none" else "-", mdl, m, voice, yolo, cont, thread)
     )
 
 def _help(bs):
@@ -230,7 +242,7 @@ PROJECTS:
 
 CURSOR:
   cursor <prompt>       - send prompt to Cursor Agent (-p)
-  new context / fresh   - next cursor starts without --continue
+  new context / fresh   - next cursor starts a new pinned thread
 
 MODE:
   mode agent / ask / shell        - switch mode (same context)
@@ -283,6 +295,81 @@ def _agent_env():
         env["NODE_OPTIONS"] = heap
     return env
 
+def _chat_bucket(pd):
+    """CLI stores chats under ~/.cursor/chats/<md5(resolved cwd)>/<uuid>/."""
+    key = hashlib.md5(str(Path(pd).resolve()).encode()).hexdigest()
+    return CHATS_DIR / key
+
+def _store_db(pd, chat_id):
+    return _chat_bucket(pd) / chat_id / "store.db"
+
+def _latest_chat_id(pd):
+    bucket = _chat_bucket(pd)
+    if not bucket.is_dir():
+        return ""
+    best, best_mtime = "", -1.0
+    for d in bucket.iterdir():
+        if not d.is_dir() or not _UUID_RE.fullmatch(d.name):
+            continue
+        db = d / "store.db"
+        if not db.is_file():
+            continue
+        m = db.stat().st_mtime
+        if m >= best_mtime:
+            best, best_mtime = d.name, m
+    return best
+
+def _create_chat(pd):
+    """Reserve a new CLI chat id in this project's cwd bucket."""
+    try:
+        r = subprocess.run(
+            [str(CLI), "create-chat"], capture_output=True, text=True,
+            timeout=30, cwd=str(pd), env=_agent_env(),
+        )
+    except Exception:
+        return ""
+    blob = (r.stdout or "") + "\n" + (r.stderr or "")
+    m = _UUID_RE.search(blob)
+    return m.group(0) if m else ""
+
+def _set_chat_mode(pd, chat_id, cli_mode):
+    """Write session metadata.mode so --resume keeps ask/agent/plan on the same thread.
+    CLI --mode only accepts plan|ask and never resets to agent (default)."""
+    if not chat_id or not cli_mode:
+        return
+    dbp = _store_db(pd, chat_id)
+    if not dbp.is_file():
+        return
+    try:
+        con = sqlite3.connect(str(dbp), timeout=10)
+        try:
+            con.execute("PRAGMA busy_timeout=5000")
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
+            )
+            row = con.execute(
+                "SELECT value FROM meta WHERE key = ?", ("0",)
+            ).fetchone()
+            if not row or not row[0]:
+                return
+            raw = bytes.fromhex(row[0].strip())
+            meta = json.loads(raw.decode("utf-8"))
+            if not isinstance(meta, dict):
+                return
+            if meta.get("mode") == cli_mode:
+                return
+            meta["mode"] = cli_mode
+            payload = json.dumps(meta, separators=(",", ":"), ensure_ascii=False)
+            con.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                ("0", payload.encode("utf-8").hex()),
+            )
+            con.commit()
+        finally:
+            con.close()
+    except Exception:
+        return
+
 def _set_mode(bs, mode):
     """Set mode. Entering plan drops --continue (plan wants a fresh thread).
     Ask/agent/shell keep the current thread. Skip a second NEW banner if
@@ -292,6 +379,7 @@ def _set_mode(bs, mode):
     if mode == "plan" and prev != "plan":
         already_new = not bs.get("continue_enabled", True)
         bs["continue_enabled"] = False
+        bs["chat_id"] = ""
         if already_new:
             return "Mode: %s" % mode
         return (
@@ -319,8 +407,25 @@ def _cursor(bs, text):
         except subprocess.TimeoutExpired:
             return "Command timed out (30s)."
     use_continue = bs.get("continue_enabled", True)
+    chat_id = (bs.get("chat_id") or "").strip()
+    is_new = not use_continue
+    if is_new:
+        cid = _create_chat(pd)
+        if cid:
+            bs["chat_id"] = cid
+            chat_id = cid
+        else:
+            chat_id = ""
+    elif not chat_id:
+        chat_id = _latest_chat_id(pd)
+        if chat_id:
+            bs["chat_id"] = chat_id
+    if chat_id:
+        _set_chat_mode(pd, chat_id, _CLI_MODE.get(mode, "default"))
     cmd = [str(CLI), "-p"]
-    if use_continue:
+    if chat_id:
+        cmd.extend(["--resume", chat_id])
+    elif use_continue:
         cmd.append("--continue")
     if bs.get("yolo_enabled"):
         cmd.append("--yolo")
@@ -328,7 +433,7 @@ def _cursor(bs, text):
         cmd.append("--plan")
     elif mode == "ask":
         cmd.extend(["--mode", "ask"])
-    # agent = omit --mode (CLI choices are only plan|ask)
+    # agent = omit --mode (CLI choices are only plan|ask); metadata already reset
     if model:
         cmd.extend(["--model", model])
     cmd.append(text)
@@ -339,8 +444,12 @@ def _cursor(bs, text):
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
                           cwd=str(pd), env=_agent_env())
         out = (r.stdout or r.stderr).strip() or "(empty response)"
-        if not use_continue:
+        if is_new:
             out = "[new context]\n" + out
+        if not (bs.get("chat_id") or "").strip():
+            captured = _latest_chat_id(pd)
+            if captured:
+                bs["chat_id"] = captured
         return out
     except subprocess.TimeoutExpired:
         return "Cursor Agent timed out (5m)."
@@ -416,6 +525,7 @@ def dispatch(s, bs, text):
         return _force_lock(bs)
     elif op == "new_context":
         bs["continue_enabled"] = False
+        bs["chat_id"] = ""
         return "Context: NEW (next cursor starts fresh; then --continue resumes it)"
     elif op == "cursor_prompt":
         bs["_speak"] = True
